@@ -1,0 +1,34 @@
+{
+  "name": "@aalzubidy/pi-signal",
+  "version": "1.1.2-fork",
+  "description": "Connect pi to Signal Messenger via native signal-cli daemon (fork with backend readiness)",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/janesser/pi-signal.git"
+  },
+  "homepage": "https://github.com/janesser/pi-signal#readme",
+  "bugs": {
+    "url": "https://github.com/janesser/pi-signal/issues"
+  },
+  "author": "aasystemsllc-aalzubidy",
+  "license": "MPL-2.0",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "bundledDependencies": [],
+  "scripts": {}
+}

@@ -1,0 +1,1801 @@
+// @ts-nocheck
+// TypeScript types are provided by pi at runtime via jiti.
+// This extension uses runtime-only imports; type checking is skipped.
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import * as http from "node:http";
+import * as path from "node:path";
+
+// ── Configuration ─────────────────────────────────────────────────────
+
+// Absolute path to the installed package root (parent of extensions/), so
+// commands can point at scripts/setup.sh regardless of where pi installed
+// this package (npm registry install, local dev checkout, etc). `pi` runs
+// extensions through jiti, which supports CommonJS-style `__dirname` even
+// though this file is authored as an ES module.
+const PACKAGE_ROOT = path.resolve(__dirname, "..");
+const SETUP_SCRIPT_PATH = path.join(PACKAGE_ROOT, "scripts", "setup.sh");
+
+const PI_SIGNAL_ACCOUNT = process.env.PI_SIGNAL_ACCOUNT || "";
+
+// The daemon exposes a JSON-RPC API for sends and an SSE endpoint for receives.
+// Uses in-memory SSE streaming — no log file on disk (more secure).
+const SIGNAL_DAEMON_URL =
+	process.env.PI_SIGNAL_DAEMON_URL || "http://127.0.0.1:8080";
+
+// When running multiple pi instances, only the primary instance should
+// process Signal messages. Set PI_SIGNAL_PRIMARY=true on the instance
+// that should handle Signal. All other instances ignore incoming messages.
+const PI_SIGNAL_PRIMARY =
+	process.env.PI_SIGNAL_PRIMARY === "true" ||
+	process.env.PI_SIGNAL_PRIMARY === "1" ||
+	process.env.PI_SIGNAL_PRIMARY === "yes";
+
+// Default stats mode: "off" | "short" | "full"
+const DEFAULT_STATS_MODE = (
+	process.env.PI_SIGNAL_STATS || "short"
+).toLowerCase();
+
+// SSE reconnect backoff parameters (mirrors hermes-agent)
+const SSE_RETRY_DELAY_INITIAL = 2000; // ms
+const SSE_RETRY_DELAY_MAX = 60_000; // ms
+
+// Backend readiness: command to run when cyberkleiber's llama.cpp backend is
+// unreachable, before any message is sent to the agent. When this env var is not
+// set, the gate is skipped entirely — feature opt-in, fail-closed.
+const PI_SIGNAL_WAKEUP_CMD = process.env.PI_SIGNAL_WAKEUP_CMD || "";
+
+// Wait time in seconds after executing PI_SIGNAL_WAKEUP_CMD, before re-checking
+// whether the backend became reachable again.
+const PI_SIGNAL_WAKEUP_DELAY = parseInt(process.env.PI_SIGNAL_WAKEUP_DELAY || "30", 10);
+
+// Maximum number of retry attempts to reach the backend before proceeding anyway.
+const MAX_BACKEND_RETRIES = parseInt(process.env.PI_SIGNAL_MAX_BACKEND_RETRIES || "5", 10);
+
+// ── Backend readiness gate ────────────────────────────────────────
+
+/** Check whether cyberkleiber's llama.cpp backend is reachable on port 8081. */
+async function checkBackendReachable(): Promise<boolean> {
+	const result = await pi.exec("curl", [
+		"-s",
+		"--max-time",
+		"5",
+		"-o",
+		"/dev/null",
+		"-w",
+		"%{http_code}",
+		"http://cyberkleiber.fritz.box:8081/",
+	], { timeout: 10_000 });
+	return result.stdout.trim() === "200";
+}
+
+/**
+ * Wait for the backend to be reachable before any message reaches the agent.
+ * Exec'ing PI_SIGNAL_WAKEUP_CMD when offline, then waiting PI_SIGNAL_WAKEUP_DELAY
+ * and re-checking — bounded number of attempts (`MAX_BACKEND_RETRIES`). When the
+ * machine stays unreachable after all retries, log and proceed anyway so Signal
+ * messages never get queued. Skipped entirely when the env var is not set
+ * (opt-in, fail-closed).
+ */
+async function waitForBackendReachable(): Promise<void> {
+	if (!PI_SIGNAL_WAKEUP_CMD) return; // feature disabled when envvar not set
+
+	let reachable = await checkBackendReachable();
+	for (let attempt = 0; attempt < MAX_BACKEND_RETRIES && !reachable; attempt++) {
+		console.log(`[signal] backend unreachable, exec'ing PI_SIGNAL_WAKEUP_CMD`);
+		await pi.exec("bash", ["-c", PI_SIGNAL_WAKEUP_CMD], { timeout: 120_000 });
+		console.log(`[signal] waiting ${PI_SIGNAL_WAKEUP_DELAY}s before re-checking backend`);
+		await new Promise(resolve => setTimeout(resolve, PI_SIGNAL_WAKEUP_DELAY * 1000));
+		reachable = await checkBackendReachable();
+	}
+	if (!reachable) console.warn(`[signal] backend still unreachable after ${MAX_BACKEND_RETRIES} retries, proceeding anyway`);
+}
+
+// ── Extension ──────────────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+	// SSE stream state
+	let sseRequest: http.ClientRequest | null = null;
+	let sseReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let sseReconnectDelay = SSE_RETRY_DELAY_INITIAL;
+	let sseConnected = false;
+
+	// Resolved Signal UUID (ACI) for our own account — resolves from
+	// phone number to UUID at startup via listContacts RPC. Using the
+	// UUID rather than the raw phone number in recipient triggers
+	// signal-cli's sendSelfMessage() path → grey (synced) bubbles.
+	let resolvedAccountId: string | null = null;
+
+	// Pending reaction (Note-to-Self feedback cycle)
+	let pendingReaction: {
+		recipient: string;
+		targetAuthor: string;
+		timestamp: number;
+	} | null = null;
+
+	// Track the current Signal sender context so we can send the agent's
+	// response back to Signal automatically.
+	let currentSignalSender: {
+		number: string;
+		sender: string;
+		timestamp: number;
+	} | null = null;
+
+	// ── Feature state ────────────────────────────────────────────────
+
+	/** Stored extension context (captured from session_start) for command handling */
+	let extCtx: ExtensionContext | null = null;
+
+	/** Stats verbosity mode. Can be changed via /stats command. */
+	let statsMode: "off" | "short" | "full" =
+		DEFAULT_STATS_MODE === "full" ? "full"
+		: DEFAULT_STATS_MODE === "off" ? "off"
+		: "short";
+
+	/**
+	 * When true, normal messages from Signal are NOT forwarded to the agent.
+	 * Toggled via /pause and /resume. Commands (including /resume) still work.
+	 */
+	let paused = false;
+
+	/** The last agent reply text sent back to Signal, for /resend. */
+	let lastAgentReply: string | null = null;
+
+	/**
+	 * Parse a single JSON line from the signal-cli daemon SSE stream.
+	 * Format: { envelope: { source, sourceName, dataMessage, syncMessage } }
+	 */
+	function parseEnvelope(line: string): {
+		sender: string;
+		number: string;
+		body: string;
+		timestamp: number;
+	} | null {
+		let raw: unknown;
+		try {
+			raw = JSON.parse(line);
+		} catch {
+			return null;
+		}
+		if (!raw || typeof raw !== "object") return null;
+
+		// Extract envelope from native SSE format
+		let env: Record<string, unknown> | null = null;
+		if (
+			raw !== null &&
+			typeof raw === "object" &&
+			"envelope" in (raw as Record<string, unknown>)
+		) {
+			env = (raw as Record<string, unknown>).envelope as Record<
+				string,
+				unknown
+			>;
+		}
+		if (!env) return null;
+
+		// Extract message body
+		// Note: "Note to Self" messages arrive as syncMessage.sentMessage (not dataMessage)
+		let body: string | undefined;
+		let isNoteToSelf = false;
+		if (env.dataMessage && typeof env.dataMessage === "object") {
+			const dm = env.dataMessage as Record<string, unknown>;
+			body =
+				(dm.body as string | undefined) || (dm.message as string | undefined);
+		}
+		// Check for syncMessage (Note to Self / messages synced from other devices)
+		if (!body && env.syncMessage && typeof env.syncMessage === "object") {
+			const sm = env.syncMessage as Record<string, unknown>;
+			// Note to Self: body is in syncMessage.sentMessage.message, AND the
+			// message was addressed to our own account (destination === account).
+			// signal-cli emits syncMessage.sentMessage for EVERY message this
+			// account sends from any linked device — to anyone — so the presence
+			// of a sentMessage body is NOT enough; we must confirm the recipient
+			// is ourselves, otherwise messages you send to other people would be
+			// treated as Note-to-Self and forwarded to the agent.
+			if (sm.sentMessage && typeof sm.sentMessage === "object") {
+				const sentMsg = sm.sentMessage as Record<string, unknown>;
+				const destination =
+					(sentMsg.destinationNumber as string | undefined) ||
+					(sentMsg.destination as string | undefined);
+				body =
+					(sentMsg.message as string | undefined) ||
+					(sentMsg.body as string | undefined);
+				if (body && PI_SIGNAL_ACCOUNT && destination === PI_SIGNAL_ACCOUNT) {
+					isNoteToSelf = true;
+				} else if (body) {
+					// A synced message to someone else — ignore it entirely.
+					return null;
+				}
+			}
+			// Fallback: direct body on syncMessage (some sync events)
+			if (!body) {
+				body =
+					(sm.body as string | undefined) || (sm.message as string | undefined);
+			}
+		}
+		if (!body || typeof body !== "string" || body.trim() === "") return null;
+
+		// Extract message timestamp
+		let timestamp: number = 0;
+		if (env.dataMessage && typeof env.dataMessage === "object") {
+			timestamp =
+				((env.dataMessage as Record<string, unknown>).timestamp as number) || 0;
+		}
+		// For sync messages, get timestamp from sentMessage
+		if (
+			!timestamp &&
+			isNoteToSelf &&
+			env.syncMessage &&
+			typeof env.syncMessage === "object"
+		) {
+			const sm = env.syncMessage as Record<string, unknown>;
+			if (sm.sentMessage && typeof sm.sentMessage === "object") {
+				timestamp =
+					((sm.sentMessage as Record<string, unknown>).timestamp as number) ||
+					0;
+			}
+		}
+
+		// Extract sender number
+		// For Note to Self messages, sender is the account itself
+		let number = "unknown";
+		if (isNoteToSelf && PI_SIGNAL_ACCOUNT) {
+			number = PI_SIGNAL_ACCOUNT;
+		} else if (typeof env.sourceNumber === "string") {
+			number = env.sourceNumber;
+		} else if (typeof env.source === "string") {
+			number = env.source;
+		}
+
+		// Extract sender display name
+		let sender: string = number;
+		if (isNoteToSelf) {
+			sender = "Self";
+		} else if (typeof env.sourceName === "string" && env.sourceName) {
+			sender = env.sourceName;
+		}
+
+		return { sender, number, body: body.trim(), timestamp };
+	}
+
+	// ── Command Handlers ────────────────────────────────────────────
+
+	/** Build a stats footer string for the current context. */
+	function buildStatsFooter(
+		ctx: ExtensionContext | null,
+	): string {
+		if (!ctx || statsMode === "off") return "";
+
+		const usage = ctx.getContextUsage?.();
+		const model = ctx.model;
+		const modelName = model?.name || model?.id || "unknown";
+		const provider = model?.provider || "";
+
+		const tokensIn = usage?.tokens != null ? usage.tokens : null;
+		const ctxWindow = usage?.contextWindow || null;
+		const pct = usage?.percent != null ? usage.percent : null;
+
+		if (statsMode === "short") {
+			// e.g. "───\nClaude Sonnet 4 · 1.2K ctx · 24%"
+			const parts: string[] = [modelName];
+			if (tokensIn != null) {
+				parts.push(formatTokens(tokensIn) + " ctx");
+			}
+			if (pct != null) {
+				parts.push(Math.round(pct) + "%");
+			}
+			return "\n───\n" + parts.join(" · ");
+		}
+
+		// Full mode
+		const lines: string[] = ["───"];
+		lines.push(`Model: ${modelName}${provider ? " (" + provider + ")" : ""}`);
+		if (tokensIn != null) {
+			lines.push(`Context: ${tokensIn.toLocaleString()} tokens`);
+		}
+		if (ctxWindow != null) {
+			lines.push(`Window: ${ctxWindow.toLocaleString()} tokens`);
+		}
+		if (pct != null) {
+			lines.push(`Usage: ${Math.round(pct)}%`);
+		}
+		return "\n" + lines.join("\n");
+	}
+
+	function formatTokens(n: number): string {
+		if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+		return String(n);
+	}
+
+	/**
+	 * Neutralize an untrusted contact display name before it enters the agent's
+	 * context. Contact names/usernames come from third parties' Signal profiles,
+	 * so a malicious contact could embed newlines + instructions to prompt-inject
+	 * the agent when the user asks to "send this to <name>". Collapse control
+	 * characters, newlines, bidi and zero-width marks to plain spaces, then cap
+	 * the length. Ordinary names pass through unchanged.
+	 */
+	function sanitizeContactName(s: string): string {
+		return s
+			.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 100);
+	}
+
+	/** Simple Levenshtein distance between two strings. */
+	function levenshtein(a: string, b: string): number {
+		const m = a.length;
+		const n = b.length;
+		const dp: number[][] = [];
+		for (let i = 0; i <= m; i++) {
+			dp[i] = [i];
+		}
+		for (let j = 0; j <= n; j++) {
+			dp[0][j] = j;
+		}
+		for (let i = 1; i <= m; i++) {
+			for (let j = 1; j <= n; j++) {
+				dp[i][j] = a[i - 1] === b[j - 1]
+					? dp[i - 1][j - 1]
+					: Math.min(dp[i - 1][j - 1], dp[i][j - 1], dp[i - 1][j]) + 1;
+			}
+		}
+		return dp[m][n];
+	}
+
+	/**
+	 * Fuzzy-match a partial query against a list of model labels.
+	 * Returns sorted matches with scores (0 = exact, higher = worse).
+	 */
+	function fuzzyMatchModels(
+		query: string,
+		models: Array<{ label: string; model: unknown }>,
+	): Array<{ label: string; model: unknown; score: number }> {
+		const q = query.toLowerCase().trim();
+		if (!q) return [];
+
+		const scored: Array<{ label: string; model: unknown; score: number }> = [];
+
+		for (const entry of models) {
+			const label = entry.label.toLowerCase();
+			let score = Infinity;
+
+			// Exact match (case-insensitive)
+			if (label === q) {
+				score = 0;
+			} else if (label.includes(q)) {
+		// Substring match — strong signal with slight position bonus
+		const pos = label.indexOf(q);
+		score = 0.02 + (pos / Math.max(label.length, 1)) * 0.05;
+			} else {
+				// Levenshtein distance normalized by max length
+				const dist = levenshtein(label, q);
+				const maxLen = Math.max(label.length, q.length);
+				score = dist / Math.max(maxLen, 1);
+			}
+
+			scored.push({ label: entry.label, model: entry.model, score });
+		}
+
+		// Sort by score ascending, then by label length (prefer shorter matches)
+		scored.sort((a, b) => {
+			if (a.score !== b.score) return a.score - b.score;
+			return a.label.length - b.label.length;
+		});
+
+		return scored;
+	}
+
+	/** Get all available models from context, formatted as {label, model} entries. */
+	function getModelList(ctx: ExtensionContext): Array<{ label: string; model: unknown }> {
+		const registry = ctx.modelRegistry;
+		if (!registry || typeof registry.getAll !== "function") return [];
+
+		try {
+			const models = registry.getAll() as Array<{
+				provider?: string;
+				id?: string;
+				name?: string;
+			}>;
+			return models.map((m) => ({
+				label: `${m.name || m.id || "unknown"} (${m.provider || "?"}/${m.id || "?"})`,
+				model: m,
+			}));
+		} catch {
+			return [];
+		}
+	}
+
+	/** Handle a Signal message that is a command (/model, /abort, /clear, /stats). */
+	async function handleCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		cmd: string,
+		args: string[],
+	): Promise<void> {
+		const ctx = extCtx;
+		if (!ctx) {
+			// Can't handle commands without context — forward to LLM
+			forwardToAgent(parsed);
+			return;
+		}
+
+		const reply = (text: string) => {
+			currentSignalSender = {
+				number: parsed.number,
+				sender: parsed.sender,
+				timestamp: parsed.timestamp,
+			};
+			// Use sendToSignal directly since we're handling inline
+			sendToSignal(parsed.number, text).then((ok) => {
+				if (ok) {
+					console.log(`[signal] command reply sent: ${cmd}`);
+				} else {
+					console.error(`[signal] failed to send command reply: ${cmd}`);
+				}
+			}).finally(() => {
+				currentSignalSender = null;
+			});
+		};
+
+		switch (cmd) {
+			case "model":
+				return handleModelCommand(ctx, args, reply);
+			case "abort":
+				return handleAbortCommand(ctx, parsed, reply);
+			case "clear":
+				return handleClearCommand(ctx, parsed, reply);
+			case "stats":
+				return handleStatsCommand(parsed, args, reply);
+			case "status":
+				return handleStatusCommand(parsed, reply);
+			case "resend":
+				return handleResendCommand(parsed, reply);
+			case "whoami":
+				return handleWhoamiCommand(parsed, reply);
+			case "pause":
+				return handlePauseCommand(parsed, reply);
+			case "resume":
+				return handleResumeCommand(parsed, reply);
+			case "help":
+				return handleHelpCommand(parsed, reply);
+			default:
+				// Unknown command — forward to LLM as normal message
+				forwardToAgent(parsed);
+		}
+	}
+
+	/** /model <partial_name> — fuzzy-match and switch model */
+	async function handleModelCommand(
+		ctx: ExtensionContext,
+		args: string[],
+		reply: (text: string) => void,
+	): Promise<void> {
+		const query = args.join(" ").trim();
+		if (!query) {
+			const current = ctx.model;
+			const name = current?.name || current?.id || "unknown";
+			reply(`Current model: ${name} (${current?.provider || "?"})\n\nUsage: /model <partial name>\nExamples: /model claude, /model gpt, /model sonnet`);
+			return;
+		}
+
+		const models = getModelList(ctx);
+		if (models.length === 0) {
+			reply("No models available. Configure a provider first.");
+			return;
+		}
+
+		const matches = fuzzyMatchModels(query, models);
+
+		// Check for exact model ID match before fuzzy matching
+		const qLower = query.toLowerCase().trim();
+		for (const entry of models) {
+			const entryObj = entry.model as { id?: string };
+			if (entryObj.id && entryObj.id.toLowerCase() === qLower) {
+				const ok = await pi.setModel(entry.model as any);
+				if (ok) {
+					reply(`Switched to ${entry.label}`);
+				} else {
+					reply(`Failed to switch to ${entry.label}. Check API key configuration.`);
+				}
+				return;
+			}
+		}
+
+		// Filter to reasonable matches (score < 0.5)
+		const good = matches.filter((m) => m.score < 0.5);
+		if (good.length === 0) {
+			// Show closest few
+			const closest = matches.slice(0, 5);
+			const lines = closest.map(
+				(m, i) => `${i + 1}. ${m.label}`,
+			);
+			reply(
+				`No close match for "${query}". Did you mean:\n${lines.join("\n")}`,
+			);
+			return;
+		}
+
+		// If exact or very close match (score < 0.15), switch immediately
+		const best = good[0];
+		if (good.length === 1 && best.score < 0.15) {
+			const ok = await pi.setModel(best.model as any);
+			if (ok) {
+				reply(`Switched to ${best.label}`);
+			} else {
+				reply(`Failed to switch to ${best.label}. Check API key configuration.`);
+			}
+			return;
+		}
+
+		// Multiple matches — show options
+		const show = good.slice(0, 10);
+		const lines = show.map((m, i) => `${i + 1}. ${m.label}`);
+		reply(
+			`Multiple matches for "${query}":\n${lines.join("\n")}\n\nSend a more specific query.`,
+		);
+	}
+
+	/** /abort — stop the current LLM generation */
+	async function handleAbortCommand(
+		ctx: ExtensionContext,
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (ctx.isIdle()) {
+			reply("Nothing to abort — the agent is idle.");
+			return;
+		}
+
+		ctx.abort();
+		reply("⏹ Response aborted.");
+
+		// Swap 👀 → 🛑 on the original message
+		if (parsed.timestamp) {
+			await removeReaction(parsed.number, parsed.number, parsed.timestamp);
+			await sendReaction(parsed.number, parsed.number, parsed.timestamp, "🛑");
+		}
+	}
+
+	/** /clear — start a new session */
+	async function handleClearCommand(
+		ctx: ExtensionContext,
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		// If currently streaming, abort first
+		if (!ctx.isIdle()) {
+			ctx.abort();
+			// Small wait to let abort settle
+			await new Promise((r) => setTimeout(r, 300));
+		}
+
+		reply("🧹 Starting new session…");
+
+		try {
+			if (typeof (ctx as any).newSession === "function") {
+				await (ctx as any).newSession({
+					withSession: async (_newCtx: unknown) => {
+						console.log("[signal] new session started via /clear");
+					},
+				});
+			} else {
+				console.log("[signal] newSession not available on context");
+			}
+		} catch (err) {
+			console.error("[signal] /clear error:", err);
+		}
+	}
+
+	/** /stats [short|full|off] — view or change stats mode */
+	async function handleStatsCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		args: string[],
+		reply: (text: string) => void,
+	): Promise<void> {
+		const arg = args[0]?.toLowerCase();
+
+		if (!arg) {
+			// Show current stats mode and usage
+			const ctx = extCtx;
+			let usageLine = "";
+			if (ctx) {
+				const usage = ctx.getContextUsage?.();
+				if (usage?.percent != null) {
+					usageLine = ` · ${Math.round(usage.percent)}% context used`;
+				}
+			}
+			reply(`Stats mode: ${statsMode}${usageLine}\n\nUsage:\n/stats short — enable short stats (default)\n/stats full  — enable full stats\n/stats off   — disable stats`);
+			return;
+		}
+
+		if (arg === "short" || arg === "full" || arg === "off") {
+			statsMode = arg;
+			reply(`Stats mode set to: ${arg}`);
+		} else {
+			reply(`Invalid stats mode "${arg}". Use: short, full, off`);
+		}
+	}
+
+	/** Forward a message to the LLM agent (normal flow). */
+	function forwardToAgent(parsed: {
+		sender: string;
+		number: string;
+		body: string;
+		timestamp: number;
+	}) {
+		// Track sender context for auto-response
+		currentSignalSender = {
+			number: parsed.number,
+			sender: parsed.sender,
+			timestamp: parsed.timestamp,
+		};
+
+		// Send 👀 reaction immediately on received message
+		if (parsed.timestamp) {
+			pendingReaction = {
+				recipient: parsed.number,
+				targetAuthor: parsed.number,
+				timestamp: parsed.timestamp,
+			};
+			sendReaction(parsed.number, parsed.number, parsed.timestamp, "👀").then(
+				(ok) => {
+					if (!ok) console.error("[signal] failed to send 👀 reaction");
+				},
+			);
+		}
+
+		const formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
+		await waitForBackendReachable();
+		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
+	}
+
+	/** /help — list available commands */
+	async function handleHelpCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		reply(
+			"Available commands:\n" +
+			"/model <name> — switch model (fuzzy match)\n" +
+			"/abort — stop current generation\n" +
+			"/clear — start new session\n" +
+			"/stats [short|full|off] — toggle usage stats\n" +
+			"/status — show live connection & model info\n" +
+			"/whoami — show model, directory, and session\n" +
+			"/resend — resend the last reply\n" +
+			"/pause — stop processing incoming messages\n" +
+			"/resume — resume processing\n" +
+			"/help — show this help",
+		);
+	}
+
+	/**
+	 * /status — report live status from in-memory state ONLY (no network
+	 * calls). Receiving this command already proves the daemon and SSE stream
+	 * are healthy, so we never need to hit the daemon — the reply is instant
+	 * and cannot hang. Note: if pi or the daemon is down, this command is never
+	 * received in the first place, so /status can only ever confirm "up".
+	 */
+	async function handleStatusCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		const ctx = extCtx;
+		const model = ctx?.model;
+		const modelName = model?.name || model?.id || "unknown";
+		const providerSuffix = model?.provider ? ` (${model.provider})` : "";
+		const lines = [
+			"✅ pi is up and receiving Signal.",
+			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
+			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
+			`SSE stream: ${sseConnected ? "connected" : "disconnected"}`,
+			`Model: ${modelName}${providerSuffix}`,
+			`Stats: ${statsMode}`,
+			`State: ${paused ? "⏸ paused (send /resume)" : "active"}`,
+		];
+		reply(lines.join("\n"));
+	}
+
+	/** /resend — re-send the last agent reply (recover a dropped message). */
+	async function handleResendCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (!lastAgentReply) {
+			reply("Nothing to resend yet.");
+			return;
+		}
+		reply(lastAgentReply);
+	}
+
+	/** /whoami — show current model, working directory, and session. */
+	async function handleWhoamiCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		const ctx = extCtx;
+		const model = ctx?.model;
+		const modelName = model?.name || model?.id || "unknown";
+		const providerSuffix = model?.provider ? ` (${model.provider})` : "";
+		let sessionName: string | undefined;
+		try {
+			sessionName = pi.getSessionName?.();
+		} catch {
+			sessionName = undefined;
+		}
+		const lines = [
+			`Model: ${modelName}${providerSuffix}`,
+			`Directory: ${ctx?.cwd || "unknown"}`,
+			`Session: ${sessionName || "(unnamed)"}`,
+			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
+			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
+		];
+		reply(lines.join("\n"));
+	}
+
+	/** /pause — stop forwarding normal messages to the agent. */
+	async function handlePauseCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (paused) {
+			reply("Already paused. Send /resume to re-enable.");
+			return;
+		}
+		paused = true;
+		reply(
+			"⏸ Paused. Incoming messages will be ignored until you send /resume. Commands still work.",
+		);
+	}
+
+	/** /resume — resume forwarding normal messages to the agent. */
+	async function handleResumeCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (!paused) {
+			reply("Not paused — messages are already being processed.");
+			return;
+		}
+		paused = false;
+		reply("▶️ Resumed. Messages will be processed again.");
+	}
+
+	/** Intercept commands from Signal: /model, /abort, /clear, /stats, /status, /whoami, /resend, /pause, /resume, /help */
+	function injectMessage(parsed: {
+		sender: string;
+		number: string;
+		body: string;
+		timestamp: number;
+	}) {
+		// Only process Note-to-Self messages (from own account). Silently drop
+		// anything else — no log; these are just other people's messages.
+		if (parsed.number !== PI_SIGNAL_ACCOUNT) {
+			return;
+		}
+
+		const body = parsed.body.trim();
+
+		// Check for commands
+		if (body.startsWith("/")) {
+			const parts = body.slice(1).split(/\s+/);
+			const cmd = parts[0].toLowerCase();
+			const args = parts.slice(1);
+			handleCommand(parsed, cmd, args).catch((err) => {
+				console.error(`[signal] command error (${cmd}):`, err);
+			});
+			return;
+		}
+
+		// Normal message — forward to agent, unless paused via /pause.
+		if (paused) {
+			sendToSignal(parsed.number, "⏸ Paused. Send /resume to re-enable.").catch(
+				() => {},
+			);
+			return;
+		}
+		forwardToAgent(parsed);
+	}
+
+	// ── Daemon JSON-RPC helpers ──────────────────────────────────────
+
+	/** Call the signal-cli daemon JSON-RPC API. */
+	async function daemonRpc(
+		method: string,
+		params: Record<string, unknown>,
+	): Promise<{ ok: boolean; result?: unknown; error?: unknown }> {
+		const payload = JSON.stringify({
+			jsonrpc: "2.0",
+			method,
+			params,
+			id: Date.now(),
+		});
+		const result = await pi.exec(
+			"curl",
+			[
+				"-s",
+				"-f",
+				"-X",
+				"POST",
+				`${SIGNAL_DAEMON_URL}/api/v1/rpc`,
+				"-H",
+				"Content-Type: application/json",
+				"-d",
+				payload,
+				"--max-time",
+				"15",
+			],
+			{ timeout: 20_000 },
+		);
+		if (result.code !== 0) return { ok: false };
+		try {
+			const json = JSON.parse(result.stdout);
+			if (json.error) return { ok: false, error: json.error };
+			return { ok: true, result: json.result };
+		} catch {
+			return { ok: false };
+		}
+	}
+
+	/** Send an emoji reaction to a Signal message. */
+	async function sendReaction(
+		destination: string,
+		targetAuthor: string,
+		timestamp: number,
+		emoji: string,
+	): Promise<boolean> {
+		if (!PI_SIGNAL_ACCOUNT) return false;
+
+		// Use JSON-RPC API (CLI deadlocks on config lock held by daemon)
+		const res = await daemonRpc("sendReaction", {
+			recipient: destination,
+			targetAuthor: targetAuthor,
+			targetTimestamp: timestamp,
+			emoji,
+		});
+		return res.ok;
+	}
+
+	/** Remove all reactions from a Signal message. */
+	async function removeReaction(
+		destination: string,
+		targetAuthor: string,
+		timestamp: number,
+	): Promise<boolean> {
+		if (!PI_SIGNAL_ACCOUNT) return false;
+
+		// Use JSON-RPC API with remove flag
+		const res = await daemonRpc("sendReaction", {
+			recipient: destination,
+			targetAuthor: targetAuthor,
+			targetTimestamp: timestamp,
+			emoji: "\u200b", // empty marker — remove=true handles it
+			remove: true,
+		});
+		return res.ok;
+	}
+
+	// ── SSE Listener (in-memory, no log file) ─────────────────────────
+
+	/**
+	 * Connect to the signal-cli daemon's SSE endpoint and stream incoming
+	 * messages in-memory.  Reconnects automatically with exponential backoff
+	 * on connection drops — mirrors hermes-agent's _sse_listener pattern.
+	 *
+	 * No log file is written — all message processing happens in-memory
+	 * for better security.
+	 */
+	function startSSEListener(): void {
+		// Skip if not the primary instance
+		if (!PI_SIGNAL_PRIMARY) {
+			console.log(
+				"[signal] PI_SIGNAL_PRIMARY is not set — skipping SSE listener (another instance handles it).",
+			);
+			return;
+		}
+
+		if (!PI_SIGNAL_ACCOUNT) {
+			console.warn("[signal] PI_SIGNAL_ACCOUNT is not set — cannot start SSE listener.");
+			return;
+		}
+
+		doConnect();
+	}
+
+	function doConnect() {
+		// Clean up any existing connection
+		cleanupSSE();
+
+		const daemonUrl = new URL(SIGNAL_DAEMON_URL);
+		const ssePath = `/api/v1/events?account=${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`;
+
+		console.log(`[signal] connecting SSE to ${SIGNAL_DAEMON_URL}${ssePath}`);
+
+		const req = http.get(
+			{
+				hostname: daemonUrl.hostname,
+				port: daemonUrl.port || 8080,
+				path: ssePath,
+				timeout: 0, // no timeout — stream stays open
+			},
+			(res) => {
+				const statusCode = res.statusCode || 0;
+
+				if (statusCode !== 200) {
+					console.error(`[signal] SSE connection failed with status ${statusCode}`);
+					res.resume(); // drain the response
+					scheduleReconnect();
+					return;
+				}
+
+				console.log("[signal] SSE connected — listening for incoming messages");
+				sseConnected = true;
+				sseReconnectDelay = SSE_RETRY_DELAY_INITIAL; // reset backoff
+
+				let buffer = "";
+
+				res.on("data", (chunk: Buffer) => {
+					buffer += chunk.toString("utf8");
+
+					// Process complete lines from the buffer
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || ""; // keep incomplete line in buffer
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed) continue;
+						if (trimmed.startsWith(":")) continue; // SSE comment
+
+						// Parse SSE "data:" prefix
+						if (trimmed.startsWith("data:")) {
+							const data = trimmed.slice(5).trim();
+							if (!data) continue;
+
+							const parsed = parseEnvelope(data);
+							if (parsed) injectMessage(parsed);
+						}
+					}
+				});
+
+				res.on("end", () => {
+					console.log("[signal] SSE stream ended");
+					sseConnected = false;
+					scheduleReconnect();
+				});
+
+				res.on("error", (err) => {
+					console.error("[signal] SSE stream error:", err.message);
+					sseConnected = false;
+					scheduleReconnect();
+				});
+			},
+		);
+
+		req.on("error", (err) => {
+			console.error(`[signal] SSE connection error: ${err.message}`);
+			sseConnected = false;
+			scheduleReconnect();
+		});
+
+		req.setTimeout(0); // no timeout
+
+		sseRequest = req;
+	}
+
+	function scheduleReconnect() {
+		if (sseReconnectTimer) return; // already scheduled
+
+		const delay = sseReconnectDelay;
+		console.log(`[signal] reconnecting SSE in ${delay}ms`);
+
+		sseReconnectTimer = setTimeout(() => {
+			sseReconnectTimer = null;
+			// Exponential backoff, capped at max
+			sseReconnectDelay = Math.min(
+				sseReconnectDelay * 2,
+				SSE_RETRY_DELAY_MAX,
+			);
+			doConnect();
+		}, delay);
+	}
+
+	function cleanupSSE() {
+		if (sseReconnectTimer) {
+			clearTimeout(sseReconnectTimer);
+			sseReconnectTimer = null;
+		}
+		if (sseRequest) {
+			sseRequest.destroy();
+			sseRequest = null;
+		}
+		sseConnected = false;
+	}
+
+	// ── Account ID resolution ──────────────────────────────────────
+
+	/**
+	 * Resolve our own phone number (PI_SIGNAL_ACCOUNT) to a Signal UUID
+	 * by calling the listContacts RPC.  Using the UUID (ACI) rather than
+	 * the raw phone number in the `recipient` array is the key to getting
+	 * signal-cli's `sendSelfMessage()` path to fire, which produces grey
+	 * (synced) bubbles instead of blue (outgoing) ones.
+	 *
+	 * This mirrors what hermes-agent does:
+	 * https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/signal.py
+	 */
+	async function resolveAccountId(): Promise<string | null> {
+		if (!PI_SIGNAL_ACCOUNT) return null;
+
+		const res = await daemonRpc("listContacts", {
+			account: PI_SIGNAL_ACCOUNT,
+			allRecipients: true,
+		});
+		if (!res.ok || !Array.isArray(res.result)) {
+			console.log("[signal] listContacts failed — falling back to phone number");
+			return null;
+		}
+
+		const contacts = res.result as Array<Record<string, unknown>>;
+		for (const contact of contacts) {
+			const number = contact.number as string | undefined;
+			if (number && number === PI_SIGNAL_ACCOUNT) {
+				// Try uuid first, then aci (older signal-cli uses "uuid")
+				const uuid = (contact.uuid as string) || (contact.aci as string) || null;
+				if (uuid) {
+					console.log(`[signal] resolved account UUID: ${uuid}`);
+					return uuid;
+				}
+			}
+		}
+
+		console.log("[signal] account not found in contacts — falling back to phone number");
+		return null;
+	}
+
+	// ── Send response back to Signal ──────────────────────────────
+
+	/**
+	 * Send a text message back to Signal via the daemon JSON-RPC API.
+	 * Used for auto-replying with the agent's response.
+	 *
+	 * Color note (Note-to-Self): to make replies show up **grey** (as if
+	 * synced from another linked device) we send with `recipient` set to
+	 * the account number and let signal-cli's own self-detection route the
+	 * message through `SendHelper.sendSelfMessage()`. That method wraps the
+	 * message in a `SentTranscriptMessage` and delivers it as a
+	 * `SignalServiceSyncMessage`, which the phone app renders as grey.
+	 *
+	 * Do NOT use `noteToSelf` — it bypasses the `sendSelfMessage()` path on
+	 * some signal-cli versions and falls through to a normal outgoing
+	 * dataMessage, which renders **blue** (as if you typed it).
+	 *
+	 * Do NOT use `notifySelf: true` — that also forces the outgoing
+	 * dataMessage path (blue).
+	 *
+	 * Prerequisite: the Signal phone app must be a separate linked device
+	 * from the daemon (multi-device). If you only have one device,
+	 * `sendSelfMessage` in signal-cli's SendHelper is a no-op
+	 * (`!account.isMultiDevice()` guard) and the message will fall through
+	 * to the normal outgoing path (blue).
+	 *
+	 * This approach matches what hermes-agent does (see
+	 * https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/signal.py).
+	 */
+	async function sendToSignal(
+		_recipient: string,
+		message: string,
+	): Promise<boolean> {
+		if (!message || !message.trim()) return false;
+
+		// Truncate very long messages (Signal limit is ~8000 chars)
+		const maxLen = 7800;
+		let text = message.trim();
+		if (text.length > maxLen) {
+			text =
+				text.slice(0, maxLen) +
+				"\n\n[truncated — response too long for Signal]";
+		}
+
+		// Use the resolved UUID (if available) so signal-cli's self-detection
+		// kicks in and routes through sendSelfMessage → grey (synced) rendering.
+		// Include the `account` parameter as signal-cli needs it to know which
+		// linked device to act as.
+		const targetId = resolvedAccountId || PI_SIGNAL_ACCOUNT;
+		const res = await daemonRpc("send", {
+			account: PI_SIGNAL_ACCOUNT,
+			recipient: [targetId],
+			message: text,
+		});
+		return res.ok;
+	}
+
+	// ── Lifecycle ─────────────────────────────────────────────────────
+
+	pi.on("session_start", async (_event: unknown, ctx: unknown) => {
+		// Store context for command handlers
+		extCtx = ctx as ExtensionContext | null;
+
+		// Resolve our phone number to a Signal UUID so outgoing messages
+		// use the recipient-based sync path (grey bubbles instead of blue).
+		resolvedAccountId = await resolveAccountId();
+
+		// Start the SSE listener for incoming messages (in-memory)
+		startSSEListener();
+
+		// Notify if the systemd service is not running
+		const result = await pi.exec("systemctl", [
+			"is-active",
+			"signal-receive.service",
+		]);
+		if (result.code !== 0) {
+			if (ctx && typeof ctx === "object" && "ui" in ctx) {
+				(ctx as Record<string, unknown>).ui?.notify?.(
+					"signal-receive.service is not running. Run /signal-start to start it, or see /signal-setup.",
+					"warning",
+				);
+			}
+		}
+	});
+
+	// Auto-send agent responses back to Signal, with stats footer
+	pi.on("agent_end", async (event: unknown, ctx: unknown) => {
+		if (!currentSignalSender) return;
+
+		const sender = currentSignalSender;
+		currentSignalSender = null;
+
+		try {
+			// Extract assistant messages from this turn
+			const messages =
+				(event as { messages?: Array<{ role?: string; content?: unknown }> })
+					.messages ?? [];
+			const assistantMessages = messages.filter((m) => m.role === "assistant");
+
+			if (assistantMessages.length === 0) return;
+
+			// Combine all assistant text content
+			const textParts: string[] = [];
+			for (const msg of assistantMessages) {
+				const content = msg.content;
+				if (typeof content === "string") {
+					textParts.push(content);
+				} else if (Array.isArray(content)) {
+					for (const part of content) {
+						if (
+							part &&
+							typeof part === "object" &&
+							(part as { type?: string }).type === "text"
+						) {
+							const text = (part as { text?: string }).text;
+							if (text) textParts.push(text);
+						}
+					}
+				}
+			}
+
+			let fullText = textParts.join("\n").trim();
+			if (!fullText) return;
+
+			// Append stats footer if enabled
+			if (statsMode !== "off") {
+				const statsFooter = buildStatsFooter(ctx as ExtensionContext | null);
+				if (statsFooter) {
+					fullText += statsFooter;
+				}
+			}
+
+			// Remember the exact text sent so /resend can replay it.
+			lastAgentReply = fullText;
+
+			const ok = await sendToSignal(sender.number, fullText);
+			if (ok) {
+				console.log(`[signal] auto-reply sent to ${sender.number}`);
+				// Swap 👀 → ✅
+				if (sender.timestamp) {
+					await removeReaction(sender.number, sender.number, sender.timestamp);
+					await sendReaction(
+						sender.number,
+						sender.number,
+						sender.timestamp,
+						"✅",
+					);
+				}
+			} else {
+				console.error(`[signal] failed to auto-reply to ${sender.number}`);
+				if (sender.timestamp) {
+					await removeReaction(sender.number, sender.number, sender.timestamp);
+					await sendReaction(
+						sender.number,
+						sender.number,
+						sender.timestamp,
+						"❌",
+					);
+				}
+			}
+		} catch (err) {
+			console.error("[signal] auto-reply error:", err);
+		}
+	});
+
+	pi.on("model_select", async (event: unknown) => {
+		const ev = event as { model?: { name?: string; id?: string } };
+		if (ev?.model) {
+			console.log(
+				`[signal] model switched to ${ev.model.name || ev.model.id || "unknown"}`,
+			);
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		cleanupSSE();
+	});
+
+	// ── Tool: signal_send ──────────────────────────────────────────
+
+	pi.registerTool({
+		name: "signal_send",
+		label: "Signal Send",
+		description:
+			"Send a text message to a Signal user. " +
+			"Recipient must be a phone number in E.164 format, e.g. +1234567890. " +
+			"To send to someone by name, first resolve their number with " +
+			"signal_list_contacts, then call this with that number. " +
+			"Uses the signal-cli daemon JSON-RPC API.",
+		parameters: Type.Object({
+			recipient: Type.String({
+				description:
+					"Recipient phone number in E.164 format, e.g. +1234567890. Include the leading +.",
+			}),
+			message: Type.String({ description: "The message text to send." }),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { recipient: string; message: string },
+			_signal?: AbortSignal,
+		) {
+			const cleaned = params.recipient.replace(/[\s\-().]/g, "");
+			if (!/^\+[1-9]\d{1,14}$/.test(cleaned)) {
+				throw new Error(
+					`Invalid recipient "${params.recipient}". Must be E.164 format, e.g. +1234567890.`,
+				);
+			}
+
+			// For self-recipient (Note-to-Self), use the resolved UUID so
+			// signal-cli routes through sendSelfMessage → grey (synced)
+			// rendering. Always include `account` — signal-cli needs it to
+			// identify which linked device to act as.
+			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
+			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
+			const res = await daemonRpc("send", {
+				account: PI_SIGNAL_ACCOUNT,
+				recipient: [targetId],
+				message: params.message,
+			});
+			if (!res.ok) {
+				throw new Error(
+					`Signal daemon send failed: ${JSON.stringify(res.error || "unknown error")}`,
+				);
+			}
+
+			// Update reaction: 👀 → ✅
+			if (pendingReaction) {
+				const pr = pendingReaction;
+				pendingReaction = null;
+				removeReaction(pr.recipient, pr.targetAuthor, pr.timestamp)
+					.then(() => {
+						sendReaction(
+							pr.recipient,
+							pr.targetAuthor,
+							pr.timestamp,
+							"✅",
+						).catch(() => {});
+					})
+					.catch(() => {});
+			}
+
+			// Only suppress the agent_end auto-reply when the tool already
+			// delivered to SELF (Note-to-Self) — otherwise the two would
+			// duplicate. For a send to a DIFFERENT number, keep the context so
+			// agent_end delivers the agent's natural confirmation
+			// ("I've sent … to +1555…") back to Note-to-Self.
+			if (cleaned === PI_SIGNAL_ACCOUNT) {
+				currentSignalSender = null;
+			}
+
+			return {
+				content: [{ type: "text", text: `Message sent to ${cleaned}.` }],
+				details: {
+					recipient: cleaned,
+					message: params.message,
+				},
+			};
+		},
+	});
+
+	// ── Tool: signal_status ───────────────────────────────────────
+
+	pi.registerTool({
+		name: "signal_status",
+		label: "Signal Status",
+		description:
+			"Check whether signal-cli is installed, the daemon is running, " +
+			"and the SSE stream is connected.",
+		parameters: Type.Object({}),
+		async execute(
+			_toolCallId: string,
+			_params: Record<string, unknown>,
+			_signal?: AbortSignal,
+		) {
+			const lines: string[] = [];
+
+			lines.push(`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`);
+
+			// Check signal-cli binary
+			const cli = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
+			lines.push(
+				`signal-cli binary: ${cli.code === 0 ? `✓ ${cli.stdout.trim()}` : "✗ NOT installed"}`,
+			);
+
+			// Check daemon HTTP API
+			if (SIGNAL_DAEMON_URL) {
+				const daemon = await daemonRpc("version", {});
+				lines.push(
+					`daemon API (${SIGNAL_DAEMON_URL}): ${daemon.ok ? `✓ v${(daemon.result as { version?: string })?.version || "?"}` : "✗ not reachable"}`,
+				);
+			}
+
+			// Check SSE stream status (in-memory, no log file)
+			lines.push(`SSE stream: ${sseConnected ? "✓ connected" : "✗ disconnected"}`);
+
+			// Add stats mode info
+			lines.push(`Stats mode: ${statsMode}`);
+
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { lines },
+			};
+		},
+	});
+
+	// ── Tool: signal_list_contacts ────────────────────────────────
+
+	pi.registerTool({
+		name: "signal_list_contacts",
+		label: "Signal Contacts",
+		description:
+			"List known Signal contacts as name → phone number pairs. Use this to " +
+			"resolve a person's name (e.g. \"Mike\") to their E.164 number BEFORE " +
+			"calling signal_send, since signal_send only accepts a phone number. " +
+			"Pass an optional `query` to filter by name or number. If more than one " +
+			"contact matches, ask the user which one before sending. Names only " +
+			"resolve if signal-cli knows them (synced address-book contact name or " +
+			"Signal profile name).",
+		parameters: Type.Object({
+			query: Type.Optional(
+				Type.String({
+					description:
+						"Optional case-insensitive filter. Returns only contacts whose name or number contains this text. Omit to list all contacts.",
+				}),
+			),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { query?: string },
+			_signal?: AbortSignal,
+		) {
+			const res = await daemonRpc("listContacts", {
+				account: PI_SIGNAL_ACCOUNT,
+				allRecipients: true,
+			});
+			if (!res.ok || !Array.isArray(res.result)) {
+				throw new Error(
+					`Could not list contacts: ${JSON.stringify(res.error || "unknown error")}`,
+				);
+			}
+
+			const contacts = (res.result as Array<Record<string, unknown>>)
+				.map((c) => {
+					const number = (c.number as string) || "";
+					// The display name lives under different fields depending on the
+					// signal-cli version — take the first one present.
+					const name =
+						(c.name as string) ||
+						(c.profileName as string) ||
+						[c.givenName, c.familyName]
+							.filter((p) => typeof p === "string" && p)
+							.join(" ")
+							.trim() ||
+						(c.username as string) ||
+						"";
+					// Names/usernames are third-party controlled — sanitize before
+					// they reach the agent's context (prompt-injection defense).
+					return { name: sanitizeContactName(name), number };
+				})
+				// Drop numberless contacts (can't be sent via signal_send) and self.
+				.filter((c) => c.number && c.number !== PI_SIGNAL_ACCOUNT);
+
+			const q = params.query?.toLowerCase().trim();
+			const filtered = q
+				? contacts.filter(
+						(c) =>
+							c.name.toLowerCase().includes(q) || c.number.includes(q),
+					)
+				: contacts;
+
+			// Named contacts first, then alphabetical by name.
+			filtered.sort(
+				(a, b) =>
+					(a.name ? 0 : 1) - (b.name ? 0 : 1) || a.name.localeCompare(b.name),
+			);
+
+			const lines = filtered.map((c) =>
+				c.name ? `${c.name} — ${c.number}` : c.number,
+			);
+			const text = lines.length
+				? lines.join("\n")
+				: q
+					? `No contacts match "${params.query}".`
+					: "No contacts found.";
+
+			return {
+				content: [{ type: "text", text }],
+				details: { contacts: filtered, query: params.query ?? null },
+			};
+		},
+	});
+
+	// ── Signal Commands (available in TUI) ───────────────────────
+
+	pi.registerCommand("signal-model", {
+		description:
+			"Switch to a model by fuzzy-matching a partial name. Examples: /signal-model claude, /signal-model sonnet",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as ExtensionContext;
+			const models = getModelList(extensionCtx);
+			const query = args.trim();
+			if (!query) {
+				const current = extensionCtx.model;
+				const name = current?.name || current?.id || "unknown";
+				(extensionCtx.ui as any)?.notify?.(
+					`Current model: ${name} (${current?.provider || "?"})\nUsage: /signal-model <partial name>`,
+					"info",
+				);
+				return;
+			}
+
+			const matches = fuzzyMatchModels(query, models);
+			const best = matches.find((m) => m.score < 0.15);
+			if (best) {
+				const ok = await pi.setModel(best.model as any);
+				(extensionCtx.ui as any)?.notify?.(
+					ok ? `Switched to ${best.label}` : `Failed to switch to ${best.label}`,
+					ok ? "info" : "error",
+				);
+			} else {
+				const closest = matches.slice(0, 5).map((m) => m.label).join("\n");
+				(extensionCtx.ui as any)?.notify?.(
+					`No close match for "${query}". Closest:\n${closest}`,
+					"warning",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-abort", {
+		description: "Stop the current LLM generation",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as ExtensionContext;
+			if (extensionCtx.isIdle()) {
+				(extensionCtx.ui as any)?.notify?.("Nothing to abort — agent is idle.", "info");
+				return;
+			}
+			extensionCtx.abort();
+			(extensionCtx.ui as any)?.notify?.("⏹ Response aborted.", "info");
+		},
+	});
+
+	pi.registerCommand("signal-stats", {
+		description: "View or toggle stats mode. Usage: /signal-stats [short|full|off]",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as ExtensionContext;
+			const arg = args.trim().toLowerCase();
+			if (!arg) {
+				const usage = extensionCtx.getContextUsage?.();
+				const usageLine = usage?.percent != null
+					? ` · ${Math.round(usage.percent)}% context used`
+					: "";
+				(extensionCtx.ui as any)?.notify?.(
+					`Stats mode: ${statsMode}${usageLine}`,
+					"info",
+				);
+				return;
+			}
+			if (arg === "short" || arg === "full" || arg === "off") {
+				statsMode = arg;
+				(extensionCtx.ui as any)?.notify?.(`Stats mode set to: ${arg}`, "info");
+			} else {
+				(extensionCtx.ui as any)?.notify?.(
+					`Invalid stats mode "${arg}". Use: short, full, off`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-restart", {
+		description:
+			"Restart the Signal message-receive systemd service (start + stop in one step)",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			const result = await pi.exec(
+				"sudo",
+				["systemctl", "restart", "signal-receive.service"],
+				{ timeout: 20_000 },
+			);
+			if (result.code === 0) {
+				extensionCtx.ui?.notify?.("signal-receive.service restarted.", "info");
+			} else {
+				extensionCtx.ui?.notify?.(
+					`Failed to restart service: ${result.stderr || result.stdout}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-logs", {
+		description:
+			"Show recent signal-receive service logs. Usage: /signal-logs [lines] (default 50)",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			// Clamp to a sane range; default 50.
+			const parsed = parseInt(args.trim(), 10);
+			const n = Math.max(1, Math.min(500, Number.isNaN(parsed) ? 50 : parsed));
+
+			// No sudo: pi.exec runs without a TTY, so a sudo password prompt
+			// would stall until timeout. Reading a system unit's journal works
+			// without sudo for users in the systemd-journal/adm group; if it
+			// fails, we tell the user the sudo command to run themselves.
+			const result = await pi.exec(
+				"journalctl",
+				["-u", "signal-receive", "-n", String(n), "--no-pager"],
+				{ timeout: 10_000 },
+			);
+			if (result.code === 0) {
+				extensionCtx.ui?.notify?.(
+					result.stdout.trim() || "(no log output)",
+					"info",
+				);
+			} else {
+				extensionCtx.ui?.notify?.(
+					`Could not read logs (${result.stderr?.trim() || "permission denied?"}). ` +
+						`Try: sudo journalctl -u signal-receive -n ${n}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-send", {
+		description:
+			"Send a Signal message from the TUI. Usage: /signal-send <+E164> <message>",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			const trimmed = args.trim();
+			const sep = trimmed.indexOf(" ");
+			if (sep === -1) {
+				extensionCtx.ui?.notify?.(
+					"Usage: /signal-send <+E164> <message>",
+					"error",
+				);
+				return;
+			}
+
+			const rawNum = trimmed.slice(0, sep);
+			const message = trimmed.slice(sep + 1).trim();
+			const cleaned = rawNum.replace(/[\s\-().]/g, "");
+			if (!/^\+[1-9]\d{1,14}$/.test(cleaned)) {
+				extensionCtx.ui?.notify?.(
+					`Invalid number "${rawNum}". Use E.164 format, e.g. +1234567890.`,
+					"error",
+				);
+				return;
+			}
+			if (!message) {
+				extensionCtx.ui?.notify?.("Message is empty.", "error");
+				return;
+			}
+
+			// For self-recipient, use the resolved UUID so signal-cli routes
+			// through sendSelfMessage → grey (synced) rendering.
+			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
+			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
+			const res = await daemonRpc("send", {
+				account: PI_SIGNAL_ACCOUNT,
+				recipient: [targetId],
+				message,
+			});
+			extensionCtx.ui?.notify?.(
+				res.ok
+					? `Message sent to ${cleaned}.`
+					: `Send failed: ${JSON.stringify(res.error || "unknown error")}`,
+				res.ok ? "info" : "error",
+			);
+		},
+	});
+
+	// ── Legacy Commands ─────────────────────────────────────────
+
+	pi.registerCommand("signal-setup", {
+		description:
+			"Interactive setup wizard for Signal ↔ pi integration",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: {
+					notify: (msg: string, level: string) => void;
+					confirm: (title: string, msg: string) => Promise<boolean>;
+				};
+			};
+
+			extensionCtx.ui?.notify?.("Starting Signal setup wizard…", "info");
+			await setupNativeMode(extensionCtx.ui);
+		},
+	});
+
+	pi.registerCommand("signal-start", {
+		description:
+			"Start the Signal message-receive systemd service",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			const result = await pi.exec(
+				"sudo",
+				["systemctl", "start", "signal-receive.service"],
+				{ timeout: 15_000 },
+			);
+			if (result.code === 0) {
+				extensionCtx.ui?.notify?.("signal-receive.service started.", "info");
+			} else {
+				extensionCtx.ui?.notify?.(
+					`Failed to start service: ${result.stderr || result.stdout}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-stop", {
+		description:
+			"⚠️ Stop the Signal message-receive systemd service. " +
+			"WARNING: pi will no longer receive incoming Signal messages until /signal-start is run.",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			const result = await pi.exec(
+				"sudo",
+				["systemctl", "stop", "signal-receive.service"],
+				{ timeout: 15_000 },
+			);
+			if (result.code === 0) {
+				extensionCtx.ui?.notify?.(
+					"⚠️ signal-receive.service stopped. pi will not receive Signal messages until /signal-start is run.",
+					"warning",
+				);
+			} else {
+				extensionCtx.ui?.notify?.(
+					`Failed to stop service: ${result.stderr || result.stdout}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-status", {
+		description:
+			"Show Signal integration status (account, service health, stats mode)",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+			const statusLines: string[] = [];
+
+			const cli = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
+			statusLines.push(
+				`signal-cli: ${cli.code === 0 ? "✓ " + cli.stdout.trim() : "✗ NOT installed"}`,
+			);
+
+			if (SIGNAL_DAEMON_URL) {
+				const daemon = await daemonRpc("version", {});
+				statusLines.push(
+					`daemon API (${SIGNAL_DAEMON_URL}): ${daemon.ok ? `✓ v${(daemon.result as { version?: string })?.version || "?"}` : "✗ not reachable"}`,
+				);
+			}
+
+			statusLines.push(`SSE stream: ${sseConnected ? "✓ connected" : "✗ disconnected"}`);
+
+			statusLines.push(`Stats mode: ${statsMode}`);
+
+			const msg = [
+				`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
+				``,
+				...statusLines,
+			].join("\n");
+
+			extensionCtx.ui?.notify?.(msg, "info");
+		},
+	});
+
+	// ── Setup helpers ──────────────────────────────────────────────────
+
+	async function setupNativeMode(ctx: {
+		notify?: (msg: string, level: string) => void;
+		confirm?: (title: string, msg: string) => Promise<boolean>;
+	}): Promise<void> {
+		// pi's extension `exec` runs commands with stdin ignored (no TTY), so
+		// this command cannot itself run setup.sh — it needs a sudo password
+		// prompt and a blocking QR-link step. Instead, run pre-flight checks
+		// here and hand the user the exact command to run in a real terminal,
+		// resolved to wherever this package is actually installed (no need to
+		// clone the repo separately).
+
+		// Step 1: Check Java 25+
+		const javaCheck = await pi.exec("java", ["-version"], { timeout: 5_000 });
+		if (javaCheck.code !== 0) {
+			ctx.notify?.(
+				"Java 25+ is required. Install it: https://adoptium.net/",
+				"error",
+			);
+		} else {
+			ctx.notify?.("✓ Java is installed", "info");
+		}
+
+		// Step 2: Check signal-cli
+		const cliCheck = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
+		if (cliCheck.code !== 0) {
+			ctx.notify?.(
+				"signal-cli not found — setup.sh will guide you through installing it.",
+				"info",
+			);
+		} else {
+			ctx.notify?.(
+				`✓ signal-cli is installed: ${cliCheck.stdout.trim()}`,
+				"info",
+			);
+		}
+
+		// Step 3: Check systemd service status (informational only)
+		const svcStatus = await pi.exec(
+			"systemctl",
+			["is-active", "signal-receive.service"],
+			{ timeout: 5_000 },
+		);
+		if (svcStatus.code === 0) {
+			ctx.notify?.("✓ signal-receive.service is already running", "info");
+		} else {
+			ctx.notify?.("signal-receive.service is not set up yet.", "info");
+		}
+
+		// Step 4: Hand off to the deterministic installer. This needs a real
+		// terminal (sudo password, interactive QR link) that pi cannot provide.
+		ctx.notify?.(
+			`Run this in a terminal to finish setup (link device + create service):\n\n` +
+				`  bash ${SETUP_SCRIPT_PATH}\n`,
+			"info",
+		);
+	}
+}
