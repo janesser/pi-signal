@@ -46,6 +46,11 @@ const SSE_RETRY_DELAY_MAX = 60_000; // ms
 // set, the gate is skipped entirely — feature opt-in, fail-closed.
 const PI_SIGNAL_WAKEUP_CMD = process.env.PI_SIGNAL_WAKEUP_CMD || "";
 
+// Readiness check command — runs a health check on the backend and returns its
+// HTTP status code (e.g. `curl -s --max-time 5 -o /dev/null -w '%{http_code}' <url>`).
+// Replaces hard-coding the target so the gate works with any backend.
+const PI_SIGNAL_READINESS_CMD = process.env.PI_SIGNAL_READINESS_CMD || "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://cyberkleiber.fritz.box:8081/";
+
 // Wait time in seconds after executing PI_SIGNAL_WAKEUP_CMD, before re-checking
 // whether the backend became reachable again.
 const PI_SIGNAL_WAKEUP_DELAY = parseInt(process.env.PI_SIGNAL_WAKEUP_DELAY || "30", 10);
@@ -55,18 +60,9 @@ const MAX_BACKEND_RETRIES = parseInt(process.env.PI_SIGNAL_MAX_BACKEND_RETRIES |
 
 // ── Backend readiness gate ────────────────────────────────────────
 
-/** Check whether cyberkleiber's llama.cpp backend is reachable on port 8081. */
+/** Run PI_SIGNAL_READINESS_CMD and report whether the backend is reachable. */
 async function checkBackendReachable(): Promise<boolean> {
-	const result = await pi.exec("curl", [
-		"-s",
-		"--max-time",
-		"5",
-		"-o",
-		"/dev/null",
-		"-w",
-		"%{http_code}",
-		"http://cyberkleiber.fritz.box:8081/",
-	], { timeout: 10_000 });
+	const result = await pi.exec("bash", ["-c", PI_SIGNAL_READINESS_CMD], { timeout: 10_000 });
 	return result.stdout.trim() === "200";
 }
 

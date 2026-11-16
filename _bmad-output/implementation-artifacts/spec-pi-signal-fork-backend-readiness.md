@@ -21,6 +21,7 @@ context: []
 - Source: `github.com/aalzubidy/pi-signal` base today, rebase onto janesser remote later (answer to Open Q1)
 - Package name: keep `@aalzubidy/pi-signal` on the fork (answer to Open Q2)
 - Config: env vars via pi-agent/env or systemd unit; feature is **skipped when envvars are not set** — opt-in, fail-closed (answer to Open Q3)
+- Readiness check: `PI_SIGNAL_READINESS_CMD` configures the health-check command instead of hard-coding `cyberkleiber.fritz.box:8081`
 
 ## Boundaries & Constraints
 
@@ -34,7 +35,7 @@ context: []
 - Don't touch signal-cli key material in `~/.local/share/signal-cli/data/`
 - Don't parse message bodies for machine-control commands — let upstream `injectMessage()` handle commands; the fork only adds the readiness gate
 
-**Opt-in behavior:** If `PI_SIGNAL_WAKEUP_CMD` is not set, the readiness gate is skipped entirely (fork behaves like upstream).
+**Opt-in behavior:** If `PI_SIGNAL_WAKEUP_CMD` is not set, the readiness gate is skipped entirely (fork behaves like upstream). If `PI_SIGNAL_READINESS_CMD` is not set, defaults to a curl check on cyberkleiber's llama.cpp backend.
 
 ## I/O & Edge-Case Matrix
 
