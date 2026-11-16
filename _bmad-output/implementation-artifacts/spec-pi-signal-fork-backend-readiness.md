@@ -2,9 +2,9 @@
 title: "Build pi-signal fork with per-message backend readiness"
 type: 'feature'
 created: '2026-11-16'
-status: 'done'
+status: 'in-review'
 route: 'dispatch'
-baseline_commit: 'NO_VCS'
+baseline_commit: 'afa9b000ea7f396cfff88953f833ffd3b192700e'
 review_loop_iteration: 0
 context: []
 ---
@@ -64,8 +64,8 @@ context: []
 
 **Execution:**
 - [x] `/home/jan/projs/pi-signal/extensions/signal.ts` -- add readiness gate to `forwardToAgent()` -- ensure backend before sendUserMessage
-- [ ] `/home/jan/.pi/agent/settings.json` -- install fork via `pi install git:...` (replace npm package; pending janesser remote from owner)
-- [ ] `signal-pi.service` unit -- verify extension loads from registry, no other changes needed
+- [x] `/home/jan/.pi/agent/settings.json` -- install fork into packages list (replace npm package: see Implementation Notes)
+- [x] `signal-pi.service` unit -- verify extension loads from registry, no other changes needed
 
 **Acceptance Criteria:**
 - Given a Signal message arrives and cyberkleiber's llama.cpp backend is offline, when the forked extension processes it, then `PI_SIGNAL_WAKEUP_CMD` executes, the wait elapses, and the readiness check retries before sending
@@ -75,6 +75,12 @@ context: []
 ## Implementation Notes
 
 <!-- Agent-owned. Append-only during implementation: decisions made, files touched, surprises encountered. -->
+
+- **Critical bug found and fixed**: `forwardToAgent()` was declared as a plain `function` but called `await waitForBackendReachable()`, which is a syntax error (await in a non-async function). The extension could not load at all: `pi --print "test"` reported `ParseError: Unexpected reserved word 'await'` at extensions/signal.ts:646. Declaring it `async function forwardToAgent()` fixes it; the three call sites (`handleCommand`, the command switch, and the message handler) are all inside async handlers, so the change is safe. Verified loading with `pi --print "test"` (no errors; `[signal] PI_SIGNAL_PRIMARY is not set — skipping SSE listener`). All other `await`s in this file live inside `async function` declarations.
+- **Task 2 decision**: `~/.pi/agent/settings.json` now contains the fork. `pi install /home/jan/projs/pi-signal` registers it as `../../projs/pi-signal` (resolves to `/home/jan/projs/pi-signal`). The janesser remote (`git:github.com/janesser/pi-signal`) exists and is reachable but holds no commits from this fork, so installing it there would load code without the readiness gate — not the intent. `pi install git:...` is the target once the repo carries these commits (push is a manual step outside this run).
+- **Task 3 verification**: `/etc/systemd/system/signal-pi.service` runs `pi --mode rpc --no-session` with `Environment=HOME=/home/jan`, so pi-agent loads extensions from `/home/jan/.pi/agent/settings.json` — the fork entry is now in that file. No unit changes needed: the readiness-gate env vars (`PI_SIGNAL_WAKEUP_CMD`, `PI_SIGNAL_READINESS_CMD`) are opt-in and skipped when unset, which is the documented fail-closed behavior.
+- **Residual gap (closed)**: `waitForBackendReachable()` previously treated a failed `PI_SIGNAL_WAKEUP_CMD` execution as an uncaught rejection (the promise rejects instead of logging and proceeding). The diff's try/catch around line 84 fixes exactly this — log warning and proceed. See also the open item below for the remaining risk.
+- **Open item**: an uncaught rejection in `checkBackendReachable()` (line 80, the readiness *health-check* command) still propagates to `forwardToAgent()` → message dropped as an unhandled promise rejection. This contradicts the EDGE_CASE rows ("proceed with send regardless, log warning only"). A `try/catch` around the readiness check is needed to match the matrix, or the contract changes: after an ultimate wait of 60s (see NEXT_INCREMENT_NOTE), a fatal error reply goes back to the sender.
 
 ## Spec Change Log
 
@@ -90,6 +96,8 @@ context: []
 <!-- Design rationale and golden examples only when non-obvious. Keep examples to 5–10 lines. -->
 
 DESIGN_RATIONALE: Wrapping `sendUserMessage()` rather than inspecting every SSE event keeps the change in one place — every message that reaches the agent passes through this call, so the readiness gate is guaranteed to run. Fail-closed opt-in: the feature only runs when configured; a missing env var means "no readiness check", not a broken message flow.
+
+NEXT_INCREMENT_NOTE (intent_gap): Consider replacing the silent "proceed with send regardless" on final failure with an explicit fatal-error reply to the Signal sender after an ultimate wait time of **60 seconds** — i.e., if the readiness gate exhausts retries, send a message back to the sender stating that an answer is not likely to come. This bounds what is now an open-ended ~12.5min silent retry loop (EC-06/B-04), makes gate outcomes visible instead of fire-and-forget (EC-04/B-02) and converts silent drops into explicit failures (EC-01). Requires: a defined ultimate timeout, an outbound reply path to the sender (currently only `sendUserMessage` to the agent exists; `reply(text)` at line 424 is a working reply path), and renegotiation of the frozen EDGE_CASE row ("proceed with send regardless") plus the acceptance criteria. Do not merge without human approval of the new contract.
 
 ## Verification
 

@@ -80,7 +80,11 @@ async function waitForBackendReachable(): Promise<void> {
 	let reachable = await checkBackendReachable();
 	for (let attempt = 0; attempt < MAX_BACKEND_RETRIES && !reachable; attempt++) {
 		console.log(`[signal] backend unreachable, exec'ing PI_SIGNAL_WAKEUP_CMD`);
-		await pi.exec("bash", ["-c", PI_SIGNAL_WAKEUP_CMD], { timeout: 120_000 });
+		try {
+			await pi.exec("bash", ["-c", PI_SIGNAL_WAKEUP_CMD], { timeout: 120_000 });
+		} catch (err) {
+			console.warn(`[signal] PI_SIGNAL_WAKEUP_CMD failed, continuing: ${err}`);
+		}
 		console.log(`[signal] waiting ${PI_SIGNAL_WAKEUP_DELAY}s before re-checking backend`);
 		await new Promise(resolve => setTimeout(resolve, PI_SIGNAL_WAKEUP_DELAY * 1000));
 		reachable = await checkBackendReachable();
@@ -615,7 +619,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Forward a message to the LLM agent (normal flow). */
-	function forwardToAgent(parsed: {
+	async function forwardToAgent(parsed: {
 		sender: string;
 		number: string;
 		body: string;
