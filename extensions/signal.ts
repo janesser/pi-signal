@@ -49,7 +49,7 @@ const PI_SIGNAL_WAKEUP_CMD = process.env.PI_SIGNAL_WAKEUP_CMD || "";
 // Readiness check command — runs a health check on the backend and returns its
 // HTTP status code (e.g. `curl -s --max-time 5 -o /dev/null -w '%{http_code}' <url>`).
 // Replaces hard-coding the target so the gate works with any backend.
-const PI_SIGNAL_READINESS_CMD = process.env.PI_SIGNAL_READINESS_CMD || "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://cyberkleiber.fritz.box:8081/";
+const PI_SIGNAL_READINESS_CMD = process.env.PI_SIGNAL_READINESS_CMD || "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://cyberkleiber.fritz.box:8081/v1/health";
 
 // Wait time in seconds after executing PI_SIGNAL_WAKEUP_CMD, before re-checking
 // whether the backend became reachable again.
