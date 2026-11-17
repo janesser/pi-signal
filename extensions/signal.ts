@@ -61,7 +61,7 @@ const MAX_BACKEND_RETRIES = parseInt(process.env.PI_SIGNAL_MAX_BACKEND_RETRIES |
 // ── Backend readiness gate ────────────────────────────────────────
 
 /** Run PI_SIGNAL_READINESS_CMD and report whether the backend is reachable. */
-async function checkBackendReachable(): Promise<boolean> {
+async function checkBackendReachable(pi: ExtensionAPI): Promise<boolean> {
 	const result = await pi.exec("bash", ["-c", PI_SIGNAL_READINESS_CMD], { timeout: 10_000 });
 	return result.stdout.trim() === "200";
 }
@@ -74,10 +74,10 @@ async function checkBackendReachable(): Promise<boolean> {
  * messages never get queued. Skipped entirely when the env var is not set
  * (opt-in, fail-closed).
  */
-async function waitForBackendReachable(): Promise<void> {
+async function waitForBackendReachable(pi: ExtensionAPI): Promise<void> {
 	if (!PI_SIGNAL_WAKEUP_CMD) return; // feature disabled when envvar not set
 
-	let reachable = await checkBackendReachable();
+	let reachable = await checkBackendReachable(pi);
 	for (let attempt = 0; attempt < MAX_BACKEND_RETRIES && !reachable; attempt++) {
 		console.log(`[signal] backend unreachable, exec'ing PI_SIGNAL_WAKEUP_CMD`);
 		try {
@@ -87,7 +87,7 @@ async function waitForBackendReachable(): Promise<void> {
 		}
 		console.log(`[signal] waiting ${PI_SIGNAL_WAKEUP_DELAY}s before re-checking backend`);
 		await new Promise(resolve => setTimeout(resolve, PI_SIGNAL_WAKEUP_DELAY * 1000));
-		reachable = await checkBackendReachable();
+		reachable = await checkBackendReachable(pi);
 	}
 	if (!reachable) console.warn(`[signal] backend still unreachable after ${MAX_BACKEND_RETRIES} retries, proceeding anyway`);
 }
@@ -647,7 +647,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
-		await waitForBackendReachable();
+		await waitForBackendReachable(pi);
 		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 	}
 
