@@ -1124,11 +1124,11 @@ export default function (pi: ExtensionAPI) {
 		// Start the SSE listener for incoming messages (in-memory)
 		startSSEListener();
 
-		// Notify if the systemd service is not running
-		const result = await pi.exec("systemctl", [
-			"is-active",
-			"signal-receive.service",
-		]);
+		// Notify if the systemd service is not running. `--user` because
+		// signal-receive.service now lives in user space (`~/.config/systemd/user/`)
+		// after migrating from /etc/systemd/system/; a plain `systemctl` would
+		// resolve to the system bus and always report inactive here.
+		const result = await pi.exec("systemctl", ["--user", "is-active", "signal-receive.service"]);
 		if (result.code !== 0) {
 			if (ctx && typeof ctx === "object" && "ui" in ctx) {
 				(ctx as Record<string, unknown>).ui?.notify?.(
@@ -1533,8 +1533,8 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await pi.exec(
-				"sudo",
-				["systemctl", "restart", "signal-receive.service"],
+				"systemctl",
+				["--user", "restart", "signal-receive.service"],
 				{ timeout: 20_000 },
 			);
 			if (result.code === 0) {
@@ -1662,8 +1662,8 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await pi.exec(
-				"sudo",
-				["systemctl", "start", "signal-receive.service"],
+				"systemctl",
+				["--user", "start", "signal-receive.service"],
 				{ timeout: 15_000 },
 			);
 			if (result.code === 0) {
@@ -1687,8 +1687,8 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const result = await pi.exec(
-				"sudo",
-				["systemctl", "stop", "signal-receive.service"],
+				"systemctl",
+				["--user", "stop", "signal-receive.service"],
 				{ timeout: 15_000 },
 			);
 			if (result.code === 0) {
@@ -1781,7 +1781,7 @@ export default function (pi: ExtensionAPI) {
 		// Step 3: Check systemd service status (informational only)
 		const svcStatus = await pi.exec(
 			"systemctl",
-			["is-active", "signal-receive.service"],
+			["--user", "is-active", "signal-receive.service"],
 			{ timeout: 5_000 },
 		);
 		if (svcStatus.code === 0) {
